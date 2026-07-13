@@ -5,7 +5,7 @@ ETL pipeline orchestrated with Prefect 3.x
 Steps:
     1. Extract   — read raw data from SQLite views into DataFrames
     2. Transform — clean and enrich the raw data
-    3. Load      — write cleaned data to output database  (next commit)
+    3. Load      — write cleaned data to analytics.db
 """
 
 import re
@@ -13,13 +13,14 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
-from prefect import flow, task
+from prefect import flow, get_run_logger, task
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-DB_PATH = Path(r"D:\storemesh-data-engineer-test\shopdata.db")
+DB_PATH          = Path(r"D:\storemesh-data-engineer-test\shopdata.db")
+ANALYTICS_DB_PATH = Path(r"D:\storemesh-data-engineer-test\analytics.db")
 
 # ---------------------------------------------------------------------------
 # STEP 1 — EXTRACT
@@ -38,9 +39,10 @@ def extract_customers(db_path: Path = DB_PATH) -> pd.DataFrame:
             customer_id (int), full_name (str), email (str),
             phone (str), signup_date (str)
     """
+    logger = get_run_logger()
     with sqlite3.connect(db_path) as conn:
         df = pd.read_sql_query("SELECT * FROM vw_raw_customers", conn)
-    print(f"[extract_customers]     {len(df)} rows loaded.")
+    logger.info("[extract_customers]     %d rows loaded.", len(df))
     return df
 
 
@@ -56,9 +58,10 @@ def extract_orders(db_path: Path = DB_PATH) -> pd.DataFrame:
             order_id (int), customer_id (int), order_date (str),
             total_amount (float), currency (str), status (str)
     """
+    logger = get_run_logger()
     with sqlite3.connect(db_path) as conn:
         df = pd.read_sql_query("SELECT * FROM vw_raw_orders", conn)
-    print(f"[extract_orders]        {len(df)} rows loaded.")
+    logger.info("[extract_orders]        %d rows loaded.", len(df))
     return df
 
 
@@ -73,9 +76,10 @@ def extract_exchange_rates(db_path: Path = DB_PATH) -> pd.DataFrame:
         pd.DataFrame with columns:
             currency (str), rate_to_usd (float), date (str)
     """
+    logger = get_run_logger()
     with sqlite3.connect(db_path) as conn:
         df = pd.read_sql_query("SELECT * FROM vw_exchange_rates", conn)
-    print(f"[extract_exchange_rates] {len(df)} rows loaded.")
+    logger.info("[extract_exchange_rates] %d rows loaded.", len(df))
     return df
 
 
@@ -110,8 +114,12 @@ def transform_customers(df: pd.DataFrame) -> pd.DataFrame:
         .drop_duplicates(subset="customer_id", keep="first")
         .reset_index(drop=True)
     )
+    logger = get_run_logger()
     removed = original_rows - len(df)
-    print(f"[transform_customers] Deduplication removed {removed} duplicate row(s). {len(df)} records remain.")
+    logger.info(
+        "[transform_customers] Deduplication removed %d duplicate row(s). %d records remain.",
+        removed, len(df),
+    )
 
     # --- Rule 2: Standardise phone — keep digits only ----------------------
     df["phone"] = df["phone"].apply(
@@ -121,7 +129,10 @@ def transform_customers(df: pd.DataFrame) -> pd.DataFrame:
     # --- Rule 3: Fill missing email ----------------------------------------
     missing_email = df["email"].isna().sum()
     df["email"] = df["email"].fillna("unknown@domain.com")
-    print(f"[transform_customers] Filled {missing_email} missing email(s) with 'unknown@domain.com'.")
+    logger.info(
+        "[transform_customers] Filled %d missing email(s) with 'unknown@domain.com'.",
+        missing_email,
+    )
 
     return df
 
@@ -155,11 +166,16 @@ def transform_orders(
     Returns:
         Cleaned pd.DataFrame with an added ``usd_amount`` column.
     """
+    logger = get_run_logger()
+
     # --- Rule 1: Filter out invalid amounts --------------------------------
     original_rows = len(orders_df)
     orders_df = orders_df[orders_df["total_amount"] > 0].copy()
     removed = original_rows - len(orders_df)
-    print(f"[transform_orders] Filtered {removed} invalid order(s) (amount ≤ 0). {len(orders_df)} orders remain.")
+    logger.info(
+        "[transform_orders] Filtered %d invalid order(s) (amount ≤ 0). %d orders remain.",
+        removed, len(orders_df),
+    )
 
     # --- Rule 2: Convert amounts to USD ------------------------------------
     # Normalise date columns so the join key types match.
@@ -178,7 +194,10 @@ def transform_orders(
     # that specific date) with 1.0 so the amount is treated as-is (USD).
     no_rate = orders_df["rate_to_usd"].isna().sum()
     orders_df["rate_to_usd"] = orders_df["rate_to_usd"].fillna(1.0)
-    print(f"[transform_orders] {no_rate} order(s) had no exchange rate — defaulted to 1.0 (USD).")
+    logger.info(
+        "[transform_orders] %d order(s) had no exchange rate — defaulted to 1.0 (USD).",
+        no_rate,
+    )
 
     orders_df["usd_amount"] = (orders_df["total_amount"] * orders_df["rate_to_usd"]).round(4)
     orders_df = orders_df.drop(columns=["rate_to_usd"])
@@ -188,25 +207,96 @@ def transform_orders(
 
 
 # ---------------------------------------------------------------------------
-# FLOW
+# STEP 4 — LOAD
+# ---------------------------------------------------------------------------
+
+
+@task(name="load", log_prints=True)
+def load(
+    customers_df: pd.DataFrame,
+    orders_df: pd.DataFrame,
+    analytics_db_path: Path = ANALYTICS_DB_PATH,
+) -> None:
+    """Write cleaned DataFrames to the analytics SQLite database.
+
+    Creates (or replaces) two tables:
+        * ``dim_customers`` — cleaned customer dimension table.
+        * ``fct_orders``    — cleaned orders fact table with USD amounts.
+
+    Args:
+        customers_df:      Cleaned customers DataFrame from :func:`transform_customers`.
+        orders_df:         Cleaned orders DataFrame from :func:`transform_orders`.
+        analytics_db_path: Path to the output SQLite database file.
+                           The file is created automatically if it does not exist.
+    """
+    logger = get_run_logger()
+    try:
+        with sqlite3.connect(analytics_db_path) as conn:
+            customers_df.to_sql(
+                "dim_customers",
+                conn,
+                if_exists="replace",
+                index=False,
+            )
+            logger.info(
+                "[load] dim_customers written: %d rows -> %s",
+                len(customers_df), analytics_db_path,
+            )
+
+            orders_df.to_sql(
+                "fct_orders",
+                conn,
+                if_exists="replace",
+                index=False,
+            )
+            logger.info(
+                "[load] fct_orders written:    %d rows -> %s",
+                len(orders_df), analytics_db_path,
+            )
+    except Exception as exc:
+        logger.error("[load] Failed to write to %s: %s", analytics_db_path, exc)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# FLOW — full ETL orchestration
 # ---------------------------------------------------------------------------
 
 
 @flow(name="storemesh-etl-pipeline")
-def run_pipeline(db_path: Path = DB_PATH) -> None:
-    """Main Prefect flow. Executes Extract and Transform steps."""
-    # Step 1 — Extract
-    raw_customers = extract_customers(db_path)
-    raw_orders = extract_orders(db_path)
-    exchange_rates = extract_exchange_rates(db_path)
+def run_pipeline(
+    db_path: Path = DB_PATH,
+    analytics_db_path: Path = ANALYTICS_DB_PATH,
+) -> None:
+    """Main Prefect flow: Extract -> Transform Customers -> Transform Orders -> Load.
 
-    # Step 2 — Transform customers
-    clean_customers = transform_customers(raw_customers)
+    Args:
+        db_path:           Path to the source SQLite database (shopdata.db).
+        analytics_db_path: Path to the output SQLite database (analytics.db).
+    """
+    logger = get_run_logger()
+    logger.info("Pipeline started. Source: %s | Target: %s", db_path, analytics_db_path)
 
-    # Step 3 — Transform orders
-    clean_orders = transform_orders(raw_orders, exchange_rates)
+    try:
+        # Step 1 — Extract
+        raw_customers  = extract_customers(db_path)
+        raw_orders     = extract_orders(db_path)
+        exchange_rates = extract_exchange_rates(db_path)
 
-    # Step 4 (Load) will be added in the next commit.
+        # Step 2 — Transform customers
+        clean_customers = transform_customers(raw_customers)
+
+        # Step 3 — Transform orders
+        clean_orders = transform_orders(raw_orders, exchange_rates)
+
+        # Step 4 — Load
+        load(clean_customers, clean_orders, analytics_db_path)
+
+        logger.info("Pipeline finished successfully.")
+
+    except Exception as exc:
+        logger.error("Pipeline failed: %s", exc)
+        raise
 
 
 if __name__ == "__main__":
