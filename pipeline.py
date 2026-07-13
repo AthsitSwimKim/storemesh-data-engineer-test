@@ -125,23 +125,88 @@ def transform_customers(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 # ---------------------------------------------------------------------------
-# FLOW — entry point (will be extended in Steps 2 & 3)
+# STEP 3 — TRANSFORM ORDERS
+# ---------------------------------------------------------------------------
+
+
+@task(name="transform_orders", log_prints=True)
+def transform_orders(
+    orders_df: pd.DataFrame,
+    rates_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Clean and enrich the raw orders DataFrame.
+
+    Cleaning rules applied (in order):
+        1. Filter invalid amounts — drop rows where ``total_amount`` is
+           less than or equal to zero (system errors / refund artefacts).
+        2. Currency conversion — compute ``usd_amount`` by multiplying
+           ``total_amount`` by the matching ``rate_to_usd`` from the
+           exchange-rates table, looked up on **both** ``currency`` and
+           ``order_date``.  When no match is found (NULL currency, unknown
+           currency, or no rate for that date) the order is assumed to be
+           already in USD and a rate of 1.0 is applied.
+
+    Args:
+        orders_df: Raw orders DataFrame from :func:`extract_orders`.
+        rates_df:  Exchange-rates DataFrame from :func:`extract_exchange_rates`.
+
+    Returns:
+        Cleaned pd.DataFrame with an added ``usd_amount`` column.
+    """
+    # --- Rule 1: Filter out invalid amounts --------------------------------
+    original_rows = len(orders_df)
+    orders_df = orders_df[orders_df["total_amount"] > 0].copy()
+    removed = original_rows - len(orders_df)
+    print(f"[transform_orders] Filtered {removed} invalid order(s) (amount ≤ 0). {len(orders_df)} orders remain.")
+
+    # --- Rule 2: Convert amounts to USD ------------------------------------
+    # Normalise date columns so the join key types match.
+    orders_df["order_date"] = pd.to_datetime(orders_df["order_date"], errors="coerce")
+    rates_df = rates_df.copy()
+    rates_df["date"] = pd.to_datetime(rates_df["date"], errors="coerce")
+
+    # Left-join on (currency, order_date) to get the matching rate.
+    orders_df = orders_df.merge(
+        rates_df.rename(columns={"date": "order_date"}),
+        on=["currency", "order_date"],
+        how="left",
+    )
+
+    # Fill unmatched rows (NULL currency, unknown currency, or no rate for
+    # that specific date) with 1.0 so the amount is treated as-is (USD).
+    no_rate = orders_df["rate_to_usd"].isna().sum()
+    orders_df["rate_to_usd"] = orders_df["rate_to_usd"].fillna(1.0)
+    print(f"[transform_orders] {no_rate} order(s) had no exchange rate — defaulted to 1.0 (USD).")
+
+    orders_df["usd_amount"] = (orders_df["total_amount"] * orders_df["rate_to_usd"]).round(4)
+    orders_df = orders_df.drop(columns=["rate_to_usd"])
+
+    return orders_df
+
+
+
+# ---------------------------------------------------------------------------
+# FLOW
 # ---------------------------------------------------------------------------
 
 
 @flow(name="storemesh-etl-pipeline")
 def run_pipeline(db_path: Path = DB_PATH) -> None:
-    """Main Prefect flow. Executes Extract and Transform (customers) steps."""
+    """Main Prefect flow. Executes Extract and Transform steps."""
     # Step 1 — Extract
     raw_customers = extract_customers(db_path)
     raw_orders = extract_orders(db_path)
     exchange_rates = extract_exchange_rates(db_path)
 
-    # Step 2 — Transform
+    # Step 2 — Transform customers
     clean_customers = transform_customers(raw_customers)
 
-    # Step 3 (Load) will be added in the next commit.
+    # Step 3 — Transform orders
+    clean_orders = transform_orders(raw_orders, exchange_rates)
+
+    # Step 4 (Load) will be added in the next commit.
 
 
 if __name__ == "__main__":
