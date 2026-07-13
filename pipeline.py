@@ -105,6 +105,7 @@ def transform_customers(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         Cleaned pd.DataFrame with the same columns as the input.
     """
+    logger = get_run_logger()
     original_rows = len(df)
 
     # --- Rule 1: Deduplicate on customer_id, keep latest signup_date -------
@@ -114,12 +115,12 @@ def transform_customers(df: pd.DataFrame) -> pd.DataFrame:
         .drop_duplicates(subset="customer_id", keep="first")
         .reset_index(drop=True)
     )
-    logger = get_run_logger()
     removed = original_rows - len(df)
     logger.info(
         "[transform_customers] Deduplication removed %d duplicate row(s). %d records remain.",
         removed, len(df),
     )
+
 
     # --- Rule 2: Standardise phone — keep digits only ----------------------
     df["phone"] = df["phone"].apply(
