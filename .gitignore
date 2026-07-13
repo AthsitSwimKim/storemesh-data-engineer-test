@@ -1,0 +1,18 @@
+# Python environments and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# Prefect
+.prefect/
+
+# Output Data / Generated DBs (จากข้อกำหนดของโจทย์)
+analytics.db
+clean_customers.csv
+clean_orders.csv
