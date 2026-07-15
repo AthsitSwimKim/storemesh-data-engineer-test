@@ -1,39 +1,39 @@
-# Storemesh Data Engineer Test
+﻿# Storemesh Data Engineer Test
 
 ## Part 1: Data Quality Issues Discovered
 
-The following anomalies were identified by running [`exploration.sql`](exploration.sql) against the `vw_raw_customers` and `vw_raw_orders` views.
+The following anomalies were identified by running `exploration.sql` against the `vw_raw_customers` and `vw_raw_orders` views.
 
-### Issue 1 — Duplicate `customer_id` in `vw_raw_customers`
+### Issue 1 - Duplicate customer_id in vw_raw_customers
 
 Customer IDs `1` (Alice Smith) and `2` (Bob Jones) each appear **twice** with conflicting details (different emails and phone numbers). This violates primary-key uniqueness and means any downstream join on `customer_id` will produce duplicate rows, inflating aggregated metrics.
 
-### Issue 2 — Invalid `total_amount` in `vw_raw_orders` (Negative & Zero Values)
+### Issue 2 - Invalid total_amount in vw_raw_orders (Negative & Zero Values)
 
-Three orders have a `total_amount ≤ 0`:
-- Orders `103` and `113` have **negative amounts** (`-50.0`, `-100.0`) with a status of `SYSTEM_ERROR`.
-- Order `114` has a **zero amount** (`0.0`) with a status of `COMPLETED`.
+Three orders have a `total_amount <= 0`:
+- Orders `103` and `113` have **negative amounts** (-50.0, -100.0) with a status of `SYSTEM_ERROR`.
+- Order `114` has a **zero amount** (0.0) with a status of `COMPLETED`.
 
 Including these records in revenue calculations will silently corrupt financial aggregations.
 
-### Issue 3 — Orphaned Orders (Referential Integrity Violation)
+### Issue 3 - Orphaned Orders (Referential Integrity Violation)
 
 Orders `106` and `118` reference `customer_id = 99`, which **does not exist** in `vw_raw_customers`. These orphaned records indicate a missing or deleted customer, and any join-based customer enrichment will silently drop or misrepresent these orders.
 
-### Issue 4 — Orders Placed Before Customer Signup Date (Temporal Anomaly)
+### Issue 4 - Orders Placed Before Customer Signup Date (Temporal Anomaly)
 
-**10 out of 20 orders** have an `order_date` that is earlier than the corresponding customer's `signup_date`. For example, order `101` (placed `2023-05-01`) belongs to a customer who did not sign up until `2023-06-01`. This suggests a clock/timezone mismatch between systems or incorrect data backfilling.
+**10 out of 20 orders** have an `order_date` that is earlier than the corresponding customer's `signup_date`. This suggests a clock/timezone mismatch between systems or incorrect data backfilling.
 
-### Issue 5 — Missing Critical Fields (`NULL` values)
+### Issue 5 - Missing Critical Fields (NULL values)
 
 | View | Field | NULL Count |
 |---|---|---|
-| `vw_raw_customers` | `email` | 2 |
-| `vw_raw_customers` | `phone` | 2 |
-| `vw_raw_orders` | `order_date` | 1 |
-| `vw_raw_orders` | `currency` | 2 |
+| vw_raw_customers | email | 2 |
+| vw_raw_customers | phone | 2 |
+| vw_raw_orders | order_date | 1 |
+| vw_raw_orders | currency | 2 |
 
-NULL `currency` values make it impossible to convert `total_amount` to a common currency for reporting. NULL `order_date` prevents any time-series or cohort analysis.
+NULL `currency` values make it impossible to convert `total_amount` to a common currency for reporting.
 
 ---
 
@@ -73,21 +73,22 @@ python pipeline.py
 ```
 
 The pipeline will:
-1. **Extract** raw data from `shopdata.db` (`vw_raw_customers`, `vw_raw_orders`, `vw_exchange_rates`)
-2. **Transform** customers — deduplicate, standardise phone numbers, fill missing emails
-3. **Transform** orders — filter invalid amounts, convert all amounts to USD
+1. **Extract** raw data from `shopdata.db` (vw_raw_customers, vw_raw_orders, vw_exchange_rates)
+2. **Transform** customers - deduplicate, standardise phone numbers, fill missing emails
+3. **Transform** orders - filter invalid amounts, convert all amounts to USD
 4. **Load** cleaned data into `analytics.db` as `dim_customers` and `fct_orders`
 
 Expected output (Prefect logs):
+
 ```
 Pipeline started. Source: shopdata.db | Target: analytics.db
 [extract_customers]      12 rows loaded.
 [extract_orders]         20 rows loaded.
 [extract_exchange_rates] 15 rows loaded.
 [transform_customers]    Deduplication removed 2 duplicate row(s). 10 records remain.
-[transform_customers]    Filled 1 missing email(s) with 'unknown@domain.com'.
-[transform_orders]       Filtered 3 invalid order(s) (amount ≤ 0). 17 orders remain.
-[transform_orders]       14 order(s) had no exchange rate — defaulted to 1.0 (USD).
+[transform_customers]    Filled 1 missing email(s) with unknown@domain.com.
+[transform_orders]       Filtered 3 invalid order(s) (amount <= 0). 17 orders remain.
+[transform_orders]       14 order(s) had no exchange rate - defaulted to 1.0 (USD).
 [load] dim_customers written: 10 rows -> analytics.db
 [load] fct_orders written:    17 rows -> analytics.db
 Pipeline finished successfully.
@@ -101,31 +102,32 @@ Pipeline finished successfully.
 pytest tests/ -v
 ```
 
-Expected output:
-```
-29 passed in X.XXs
-```
+Expected output: `29 passed in X.XXs`
 
 The test suite covers:
-- **Customer transformations** — deduplication, phone standardisation, email fill
-- **Order transformations** — invalid-amount filtering, USD currency conversion (including edge cases: NULL currency, missing exchange rate date)
+- **Customer transformations** - deduplication, phone standardisation, email fill
+- **Order transformations** - invalid-amount filtering, USD currency conversion (including edge cases: NULL currency, missing exchange rate date)
 
-All tests are independent of any database connection and use dummy `pandas` DataFrames.
+All tests are independent of any database connection and use dummy pandas DataFrames.
 
 ---
 
 ## How to Run the SQL Queries
 
 ### Data Exploration (Part 1)
+
 ```bash
 sqlite3 shopdata.db < exploration.sql
 ```
+
 Or open `exploration.sql` in any SQLite client pointed at `shopdata.db`.
 
 ### CLV Report (Part 4)
+
 ```bash
 sqlite3 analytics.db < clv_report.sql
 ```
+
 > **Note:** Run `python pipeline.py` first to generate `analytics.db`.
 
 ---
@@ -134,14 +136,14 @@ sqlite3 analytics.db < clv_report.sql
 
 ```
 storemesh-data-engineer-test/
-├── pipeline.py          # Prefect ETL pipeline (Extract → Transform → Load)
-├── exploration.sql      # Part 1: Data quality exploration queries
-├── clv_report.sql       # Part 4: Customer Lifetime Value SQL report
-├── requirements.txt     # Python dependencies
-├── shopdata.db          # Source SQLite database (provided)
-├── analytics.db         # Output SQLite database (generated by pipeline.py)
-├── README.md            # This file
-└── tests/
-    ├── __init__.py
-    └── test_pipeline.py # pytest unit tests for transformation logic
+|-- pipeline.py          # Prefect ETL pipeline (Extract -> Transform -> Load)
+|-- exploration.sql      # Part 1: Data quality exploration queries
+|-- clv_report.sql       # Part 4: Customer Lifetime Value SQL report
+|-- requirements.txt     # Python dependencies
+|-- shopdata.db          # Source SQLite database (provided)
+|-- analytics.db         # Output SQLite database (generated by pipeline.py)
+|-- README.md            # This file
+|-- tests/
+    |-- __init__.py
+    |-- test_pipeline.py # pytest unit tests for transformation logic
 ```
